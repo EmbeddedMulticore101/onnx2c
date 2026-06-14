@@ -39,10 +39,13 @@ class QLinearConv : public SpatialFilter {
 
 	void print_output_cell_finalize(std::ostream& dst, const std::string& y_idx) const override
 	{
-		std::string float_dtype = get_input_tensor(1)->data_type_str();
-		INDT_3 << float_dtype << " scaled = ((" << float_dtype << ")a) * (x_scale[0] * w_scale[0]) / y_scale[0];" << std::endl;
-		INDT_3 << "scaled = scaled + (" << float_dtype << ")y_zero_point[0];" << std::endl;
-		INDT_3 << "y" << y_idx << " = (" << get_output_tensor(0)->data_type_str() << ") roundf(scaled);" << std::endl;
+		/*
+		 * Return the raw int32 convolution accumulator.
+		 *
+		 * Scaling is performed by a following DequantizeLinear node
+		 * using x_scale * w_scale.
+		 */
+		INDT_3 << "y" << y_idx << " = a;" << std::endl;
 	}
 
 	void print(std::ostream& dst) const override
@@ -83,7 +86,7 @@ class QLinearConv : public SpatialFilter {
 					<< "(" << x_type << "*)" << input_var << ", "
 					<< "(" << w_type << "*)" << kernel_var << ", "
 					<< bias << ", "
-					<< "x_zero_point, w_zero_point, " 
+					<< "x_zero_point, w_zero_point, "
 					<< width << ", "
 					<< in_channels << ", " << out_channels << ", "
 					<< kernel_width << ", "
@@ -113,7 +116,7 @@ class QLinearConv : public SpatialFilter {
 					<< "(" << x_type << "*)" << input_var << ", "
 					<< "(" << w_type << "*)" << kernel_var << ", "
 					<< bias << ", "
-					<< "x_zero_point, w_zero_point, " 
+					<< "x_zero_point, w_zero_point, "
 					<< height << ", " << width << ", "
 					<< in_channels << ", " << out_channels << ", "
 					<< kernel_height << ", " << kernel_width << ", "
@@ -168,7 +171,13 @@ class QLinearConv : public SpatialFilter {
 
 		Tensor* rv = new Tensor;
 		rv->data_dim = resolve_output_size();
-		rv->data_type = get_X()->data_type;
+
+		/*
+		 * The modified QLinearConv returns its raw convolution
+		 * accumulator rather than a requantized int8/uint8 value.
+		 */
+		rv->data_type = onnx::TensorProto_DataType_INT32;
+
 		register_output(rv, "y");
 
 		if (options.quant) {
