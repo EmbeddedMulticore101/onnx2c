@@ -19,13 +19,10 @@ class MaxPool : public Pooling {
 
 	virtual void parseAttributes(onnx::NodeProto& node) override
 	{
-
+		// Pooling::parseAttributes already reads storage_order.  Do not reject
+		// the attribute merely because it is present: storage_order=0 is the
+		// ONNX default and is fully compatible with the row-major index code.
 		Pooling::parseAttributes(node);
-
-		// for (const auto& a : node.attribute()) {
-		// 	if (a.name() == "storage_order")
-		// 		ERROR("Unimplemented: MaxPool storage_order attribute");
-		// }
 	}
 
 	virtual void print_output_cell_init(std::ostream& dst, const std::string& y_idx) const override
