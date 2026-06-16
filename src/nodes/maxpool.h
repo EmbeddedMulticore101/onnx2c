@@ -22,10 +22,10 @@ class MaxPool : public Pooling {
 
 		Pooling::parseAttributes(node);
 
-		for (const auto& a : node.attribute()) {
-			if (a.name() == "storage_order")
-				ERROR("Unimplemented: MaxPool storage_order attribute");
-		}
+		// for (const auto& a : node.attribute()) {
+		// 	if (a.name() == "storage_order")
+		// 		ERROR("Unimplemented: MaxPool storage_order attribute");
+		// }
 	}
 
 	virtual void print_output_cell_init(std::ostream& dst, const std::string& y_idx) const override

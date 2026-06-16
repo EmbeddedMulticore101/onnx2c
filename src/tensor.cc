@@ -498,43 +498,48 @@ std::string Tensor::print_tensor(
     bool as_const,
     bool is_definition) const
 {
-	std::string rv = "";
-	if (is_callsite == false) {
-		bool print_const = as_const || isConst;
-		if (print_const)
-			rv += "const ";
-		rv += data_type_str() + " ";
-	}
-	else if (union_no >= 0) {
-		rv += "tu" + std::to_string(union_no) + ".";
-	}
+    std::string rv = "";
 
-	if (is_scalar()) {
-		// Scalars tensors are defined as scalars,
-		// but passed between functions as pointers.
-		if (is_callsite) {
-			if (!isIO) {
-				rv += "&";
-			}
-			// else: IO tensors are never defined
-			// locally, so they already are pointers
-		}
-		// as function parameters
-		else if (!is_definition) {
-			rv += "*";
-		}
-	}
+    if (!is_callsite) {
+        bool print_const = as_const || isConst;
 
-	if (alternate_name == "")
-		rv += cname();
-	else
-		rv += alternate_name;
+        if (print_const)
+            rv += "const ";
 
-	if (is_callsite == false)
-		for (unsigned i : data_dim)
-			rv += "[" + std::to_string(i) + "]";
+        rv += data_type_str() + " ";
+    } else {
+        /*
+         * Scalar tensors are represented as scalar objects but passed to
+         * node functions through pointers. The '&' must precede the whole
+         * lvalue, including its union prefix.
+         */
+        if (is_scalar() && !isIO)
+            rv += "&";
 
-	return rv;
+        if (union_no >= 0)
+            rv += "tu" + std::to_string(union_no) + ".";
+    }
+
+    if (is_scalar()) {
+        /*
+         * Scalar parameters in function definitions are pointers.
+         * Call-site '&' handling was already done above.
+         */
+        if (!is_callsite && !is_definition)
+            rv += "*";
+    }
+
+    if (alternate_name == "")
+        rv += cname();
+    else
+        rv += alternate_name;
+
+    if (!is_callsite) {
+        for (unsigned i : data_dim)
+            rv += "[" + std::to_string(i) + "]";
+    }
+
+    return rv;
 }
 
 int Tensor::data_num_elem(void) const
