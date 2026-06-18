@@ -2,14 +2,18 @@
  *
  * DequantizeLinear node.
  *
- * Calculates:
- * y = (x - x_zero_point) * x_scale
+ * Normal ONNX path:
+ *   y = (x - x_zero_point) * x_scale
  *
- * In the QGemm split case:
- *   x            = int32 QGemm accumulator output
- *   x_scale      = a_scale * b_scale
- *   x_zero_point = 0 or omitted
- *   y            = float output
+ * Accumulator path used by modified QGemm/QLinearConv:
+ *   x       = raw int32 accumulator
+ *   x_scale = accumulator scale, already rewritten by the producer to
+ *             a_scale * b_scale or x_scale * w_scale
+ *   y       = (float)x * x_scale
+ *
+ * In the accumulator path x_zero_point is intentionally ignored. A raw int32
+ * accumulator has zero-point 0, while the ONNX graph may still pass the old
+ * uint8 output zero-point from the original quantized operator.
  */
 
 #pragma once
@@ -32,6 +36,22 @@ class DequantizeLinear : public Node {
 	virtual void parseAttributes(onnx::NodeProto& node) override;
 	virtual void resolve(void) override;
 	virtual void print(std::ostream& dst) const override;
+
+	private:
+	bool is_single_value_param(const Tensor* t) const
+	{
+		return t->rank() == 0 ||
+		       (t->rank() == 1 && t->data_dim[0] == 1);
+	}
+
+	std::string param_index_for(const Tensor* t) const
+	{
+		if (is_single_value_param(t)) {
+			return "[0]";
+		}
+
+		return "[i" + std::to_string(axis) + "]";
+	}
 };
 
 void DequantizeLinear::parseAttributes(onnx::NodeProto& node)
@@ -61,6 +81,10 @@ void DequantizeLinear::resolve(void)
 		axis += x->data_dim.size();
 	}
 
+	if (axis < 0 || axis >= (int)x->data_dim.size()) {
+		ERROR("DequantizeLinear axis out of range");
+	}
+
 	if (get_number_of_inputs() == 3 && get_input_tensor(2)) {
 		name_input(2, "x_zero_point");
 	}
@@ -84,6 +108,12 @@ void DequantizeLinear::print(std::ostream& dst) const
 
 	Tensor* x = get_input_tensor(0);
 	Tensor* x_scale = get_input_tensor(1);
+	Tensor* x_zero_point =
+		(get_number_of_inputs() == 3 && get_input_tensor(2)) ?
+		get_input_tensor(2) : nullptr;
+
+	const bool x_is_int32_accumulator =
+		x->data_type == onnx::TensorProto_DataType_INT32;
 
 	std::string index;
 
@@ -97,28 +127,31 @@ void DequantizeLinear::print(std::ostream& dst) const
 		index += "[" + name + "]";
 	}
 
-	std::string param_index;
-
-	if (x_scale->is_scalar()) {
-		param_index = "[0]";
-	}
-	else {
-		param_index = "[i" + std::to_string(axis) + "]";
-	}
+	std::string scale_index = param_index_for(x_scale);
+	std::string zero_point_index = x_zero_point ?
+		param_index_for(x_zero_point) : "[0]";
 
 	INDT_1 << "{" << std::endl;
 
-	/*
-	 * Cast x and x_zero_point to float explicitly.
-	 * This allows int32 QGemm output to be dequantized into float.
-	 */
-	INDT_2 << "y" << index << " = ((float)x" << index;
-
-	if (get_number_of_inputs() == 3 && get_input_tensor(2)) {
-		dst << " - (float)x_zero_point" << param_index;
+	if (x_is_int32_accumulator) {
+		/*
+		 * Modified QGemm/QLinearConv return a raw int32 accumulator.
+		 * Its zero point is exactly 0. The producer has rewritten x_scale
+		 * to the accumulator-domain scale, so do not subtract the stale
+		 * ONNX y_zero_point input here.
+		 */
+		INDT_2 << "y" << index << " = ((float)x" << index
+		       << ") * x_scale" << scale_index << ";" << std::endl;
 	}
+	else {
+		INDT_2 << "y" << index << " = ((float)x" << index;
 
-	dst << ") * x_scale" << param_index << ";" << std::endl;
+		if (x_zero_point) {
+			dst << " - (float)x_zero_point" << zero_point_index;
+		}
+
+		dst << ") * x_scale" << scale_index << ";" << std::endl;
+	}
 
 	INDT_1 << "}" << std::endl;
 }

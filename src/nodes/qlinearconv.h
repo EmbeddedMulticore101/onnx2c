@@ -2,6 +2,16 @@
  *
  * QLinearConv
  * Quantized Convolution
+ *
+ * Modified behavior:
+ *   The operator writes the raw int32 accumulator instead of the requantized
+ *   uint8/int8 output. During resolve(), the ONNX y_scale input is rewritten
+ *   to the accumulator-domain scale x_scale * w_scale. A following
+ *   DequantizeLinear can therefore compute:
+ *
+ *     y_float = (float)y_int32 * y_scale
+ *
+ *   with y_zero_point ignored for int32 accumulators.
  */
 
 #include "spatialfilter.h"
@@ -20,11 +30,11 @@ class QLinearConv : public SpatialFilter {
 	void print_output_cell_init(std::ostream& dst, const std::string& y_idx) const override
 	{
 		INDT_3 << "int32_t a = ";
-		if (get_number_of_inputs() < 9) {
-			dst << "0";
+		if (get_number_of_inputs() >= 9 && get_input_tensor(8)->is_used()) {
+			dst << "bias[m]";
 		}
 		else {
-			dst << "bias[m]";
+			dst << "0";
 		}
 		dst << ";" << std::endl;
 	}
@@ -41,9 +51,7 @@ class QLinearConv : public SpatialFilter {
 	{
 		/*
 		 * Return the raw int32 convolution accumulator.
-		 *
-		 * Scaling is performed by a following DequantizeLinear node
-		 * using x_scale * w_scale.
+		 * Scaling is performed by the following DequantizeLinear node.
 		 */
 		INDT_3 << "y" << y_idx << " = a;" << std::endl;
 	}
@@ -62,7 +70,7 @@ class QLinearConv : public SpatialFilter {
 			int num_spatial = (int)get_numDataDim();
 
 			int groups = group;
-			int bias_enabled = (get_number_of_inputs() == 9) ? 1 : 0;
+			int bias_enabled = (get_number_of_inputs() >= 9 && get_input_tensor(8)->is_used()) ? 1 : 0;
 
 			std::string input_var  = "x";
 			std::string output_var = "y";
@@ -146,8 +154,10 @@ class QLinearConv : public SpatialFilter {
 
 	void resolve() override
 	{
-		// TODO: Support per-channel quantization, by allowing non-scalar
-		// scale and zero-point tensors.
+		/*
+		 * This implementation supports per-tensor quantization parameters only.
+		 * The accumulator scale is therefore one scalar: x_scale * w_scale.
+		 */
 
 		name_input(0, "x");
 		name_scalar_input(1, "x_scale");
@@ -160,9 +170,11 @@ class QLinearConv : public SpatialFilter {
 		name_scalar_input(6, "y_scale");
 		name_scalar_input(7, "y_zero_point");
 
-		if (get_number_of_inputs() == 9) {
+		if (get_number_of_inputs() >= 9 && get_input_tensor(8)->is_used()) {
 			name_input(8, "bias");
 		}
+
+		rewrite_y_params_for_int32_accumulator();
 
 		resolve_strides();
 		resolve_dilations();
@@ -173,8 +185,8 @@ class QLinearConv : public SpatialFilter {
 		rv->data_dim = resolve_output_size();
 
 		/*
-		 * The modified QLinearConv returns its raw convolution
-		 * accumulator rather than a requantized int8/uint8 value.
+		 * The modified QLinearConv returns its raw convolution accumulator
+		 * rather than a requantized int8/uint8 value.
 		 */
 		rv->data_type = onnx::TensorProto_DataType_INT32;
 
@@ -275,6 +287,77 @@ class QLinearConv : public SpatialFilter {
 			get_W()->data_buffer = new_w;
 			get_W()->data_dim = ddim;
 		}
+	}
+
+	private:
+	bool is_single_value_tensor(const Tensor* t) const
+	{
+		return t->rank() == 0 ||
+		       (t->rank() == 1 && t->data_dim[0] == 1);
+	}
+
+	float read_scalar_float(const Tensor* t, const std::string& name) const
+	{
+		if (!t || !t->isConst || t->data_buffer == nullptr) {
+			ERROR("QLinearConv: " << name << " must be a constant scalar float to emit int32 accumulator output");
+		}
+		if (!is_single_value_tensor(t)) {
+			ERROR("QLinearConv: " << name << " must be scalar");
+		}
+		if (t->data_type != onnx::TensorProto_DataType_FLOAT) {
+			ERROR("QLinearConv: " << name << " must be FLOAT");
+		}
+
+		return ((float*)t->data_buffer)[0];
+	}
+
+	void write_scalar_float(Tensor* t, float value, const std::string& name) const
+	{
+		if (!t || !t->isConst || t->data_buffer == nullptr) {
+			ERROR("QLinearConv: " << name << " must be a constant scalar float to rewrite accumulator scale");
+		}
+		if (!is_single_value_tensor(t)) {
+			ERROR("QLinearConv: " << name << " must be scalar");
+		}
+		if (t->data_type != onnx::TensorProto_DataType_FLOAT) {
+			ERROR("QLinearConv: " << name << " must be FLOAT");
+		}
+
+		((float*)t->data_buffer)[0] = value;
+	}
+
+	void write_scalar_zero_point(Tensor* t, const std::string& name) const
+	{
+		if (!t || !t->isConst || t->data_buffer == nullptr) {
+			return;
+		}
+		if (!is_single_value_tensor(t)) {
+			ERROR("QLinearConv: " << name << " must be scalar");
+		}
+
+		switch (t->data_type) {
+			case onnx::TensorProto_DataType_INT8:
+				((int8_t*)t->data_buffer)[0] = 0;
+				break;
+			case onnx::TensorProto_DataType_UINT8:
+				((uint8_t*)t->data_buffer)[0] = 0;
+				break;
+			case onnx::TensorProto_DataType_INT32:
+				((int32_t*)t->data_buffer)[0] = 0;
+				break;
+			default:
+				ERROR("QLinearConv: unsupported " << name << " data type");
+		}
+	}
+
+	void rewrite_y_params_for_int32_accumulator() const
+	{
+		float x_scale = read_scalar_float(get_input_tensor(1), "x_scale");
+		float w_scale = read_scalar_float(get_input_tensor(4), "w_scale");
+		float accumulator_scale = x_scale * w_scale;
+
+		write_scalar_float(get_input_tensor(6), accumulator_scale, "y_scale");
+		write_scalar_zero_point(get_input_tensor(7), "y_zero_point");
 	}
 };
 } // namespace toC
